@@ -4,7 +4,7 @@ import keyboard, numpy as np, sounddevice as sd
 
 for _m in ("av", "onnxruntime"): sys.modules[_m] = types.ModuleType(_m)
 os.environ.setdefault("GEMINI_API_KEY", "AIzaSyAqWtDTfCKYflJJ7IlT8Vyv4mCjSNfYboE")
-DB, MODEL = "tara.db", "qwen2.5-coder:3b"
+DB, MODEL = "tara.db", "tara-core"
 APPS = {"code": "code", "vscode": "code", "kicad": "kicad", "calc": "calc.exe", "cmd": "wt.exe", "settings": "ms-settings:"}
 WEBS = {"youtube": "https://youtube.com", "github": "https://github.com", "gmail": "https://mail.google.com"}
 
@@ -33,6 +33,10 @@ def fast_route(raw: str) -> str | None:
         try: http_post("http://localhost:11434/api/generate", {"model": MODEL, "keep_alive": 0}, 2)
         except Exception: pass
         return "RAM freed."
+    if low in ("quit", "exit"):
+        try: http_post("http://localhost:11434/api/generate", {"model": MODEL, "keep_alive": 0}, 1)
+        except Exception: pass
+        os._exit(0)
     if low == "ports":
         import serial.tools.list_ports
         pts = [f"{p.device} ({p.description})" for p in serial.tools.list_ports.comports()]
@@ -86,6 +90,7 @@ class TARA(tk.Tk):
         self.stt, self.rec_buf = None, []
         keyboard.add_hotkey("alt+space", lambda: self.debounce(self.toggle_ui))
         keyboard.add_hotkey("alt+v", lambda: self.debounce(self.toggle_mic))
+        keyboard.add_hotkey("alt+q", lambda: self.debounce(self.grab_clip))
         self.anim()
 
     def debounce(self, fn):
@@ -106,7 +111,12 @@ class TARA(tk.Tk):
         if force if force is not None else not self.winfo_viewable():
             self.out.pack_forget(); self.geometry(f"{self.w}x{self.h_col}+{self.x}+12"); self.deiconify(); self.ent.focus_force()
         else: self.withdraw()
-
+    def grab_clip(self):
+            keyboard.send("ctrl+c")
+            time.sleep(0.08)
+            self.toggle_ui(True)
+            self.ent.delete(0, "end")
+            self.ent.insert(0, "clip: ")
     def toggle_mic(self):
         if not self.winfo_viewable(): self.toggle_ui(True)
         if self.state == "mic":
@@ -197,13 +207,18 @@ class TARA(tk.Tk):
         threading.Thread(target=self.ask_llm, args=(q, speak), daemon=True).start()
 
     def ask_llm(self, q: str, speak: bool):
+        clip_ctx = ""
+        if q.lower().startswith("clip:"):
+            try: clip_ctx = f"Clipboard:\n{self.clipboard_get()[:1500]}\n"
+            except Exception: pass
+            q = q[5:].strip() or "Explain or fix this clipboard content."
         facts = [r[0] for r in db_exec("SELECT v FROM mem WHERE k='fact' ORDER BY id DESC LIMIT 5")]
         hist = [r[0] for r in db_exec("SELECT v FROM mem WHERE k='chat' ORDER BY id DESC LIMIT 6")][::-1]
         sys_p = (
             "You are T.A.R.A., an equal thinking partner and co-builder. Talk naturally like a sharp close friend in 1-3 sentences. "
             "If the user wants an app opened, a YouTube search, or a fact remembered, append [CMD: open app], [CMD: yt query], or [CMD: remember fact] at the end.\n"
         )
-        ctx = sys_p + ("Facts: " + "; ".join(facts) + "\n" if facts else "") + "\n".join(hist) + f"\nYou: {q}\nTARA:"
+        ctx = ("Facts: " + "; ".join(facts) + "\n" if facts else "") + clip_ctx + "\n".join(hist) + f"\nYou: {q}\nTARA:"
         ans = ""
         try:
             if q.lower().startswith("cloud:") and os.environ.get("GEMINI_API_KEY"):

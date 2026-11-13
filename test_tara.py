@@ -44,5 +44,14 @@ def run_beta_tests():
     assert "GPIO 1" in fast_route("memories")
     db_exec("DELETE FROM mem WHERE v LIKE '%GPIO 1%'")
     print("  PASS -> SMD math & autonomous [CMD: ...] execution verified.")
+    print("[BETA TEST 7] Native Tkinter Clipboard Read (Zero pyperclip)...")
+    import tkinter as tk
+    r = tk.Tk(); r.withdraw()
+    r.clipboard_clear(); r.clipboard_append("void setup() { Serial.begin(115200); }")
+    r.update()
+    grabbed = r.clipboard_get()
+    r.destroy()
+    assert "115200" in grabbed, "Clipboard read failed"
+    print("  PASS -> Native clipboard capture verified.")
 if __name__ == "__main__":
     run_beta_tests()
