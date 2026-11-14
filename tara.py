@@ -1,9 +1,9 @@
-import os, re, sys, time, json, types, ctypes, sqlite3, threading, subprocess, webbrowser, urllib.parse, urllib.request
+import os, re, sys, time, json, types, queue, ctypes, asyncio, sqlite3, threading, subprocess, webbrowser, urllib.parse, urllib.request, concurrent.futures
 import tkinter as tk
-import keyboard, numpy as np, sounddevice as sd
+import keyboard, edge_tts, numpy as np, sounddevice as sd
 
 for _m in ("av", "onnxruntime"): sys.modules[_m] = types.ModuleType(_m)
-os.environ.setdefault("GEMINI_API_KEY", "AIzaSyAqWtDTfCKYflJJ7IlT8Vyv4mCjSNfYboE")
+if os.path.exists(".env"): os.environ.update(l.strip().split("=", 1) for l in open(".env", encoding="utf-8-sig") if "=" in l)
 DB, MODEL = "tara.db", "tara-core"
 APPS = {"code": "code", "vscode": "code", "kicad": "kicad", "calc": "calc.exe", "cmd": "wt.exe", "settings": "ms-settings:"}
 WEBS = {"youtube": "https://youtube.com", "github": "https://github.com", "gmail": "https://mail.google.com"}
@@ -15,58 +15,104 @@ def db_exec(sql, params=()):
 
 def http_post(url: str, payload: dict, timeout=15):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
-    return urllib.request.urlopen(req, timeout=timeout)
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.URLError:
+        if "11434" in url:
+            subprocess.Popen(["ollama", "serve"], creationflags=0x08000000)
+            time.sleep(1.2)
+            return urllib.request.urlopen(req, timeout=timeout)
+        raise
+_sapi = subprocess.Popen(
+    ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
+     "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+     "$s.SelectVoiceByHints([System.Speech.Synthesis.VoiceGender]::Female); $s.Rate = 1; "
+     "while(($l = [Console]::In.ReadLine()) -ne $null) { if($l){ $s.Speak($l) }; [Console]::Out.WriteLine('DONE') }"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", creationflags=0x08000000
+)
+_synth_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+_play_q, _tts_idx = queue.Queue(), 0
 
-def speak_sync(text: str):
-    clean = text.replace('"', "'").replace("\n", " ")[:400]
-    cmd = f'Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("{clean}")'
-    subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", cmd], creationflags=0x08000000)
+def _synth_mp3(text: str, idx: int) -> str | None:
+    path = os.path.abspath(f"tts_{idx % 4}.mp3")
+    try:
+        asyncio.run(edge_tts.Communicate(text, "en-US-AvaNeural", rate="+5%").save(path))
+        return path
+    except Exception:
+        return None
 
+def _tts_Loop():
+    mci = ctypes.windll.winmm.mciSendStringW
+    while True:
+        text, fut = _play_q.get()
+        try:
+            mp3 = fut.result()
+            if mp3 and os.path.exists(mp3):
+                mci(f'open "{mp3}" type mpegvideo alias v', None, 0, 0)
+                mci("play v wait", None, 0, 0)
+                mci("close v", None, 0, 0)
+                try: os.remove(mp3)
+                except OSError: pass
+            else:
+                _sapi.stdin.write(text + "\n"); _sapi.stdin.flush(); _sapi.stdout.readline()
+        finally:
+            _play_q.task_done()
+
+threading.Thread(target=_tts_Loop, daemon=True).start()
+
+def enqueue_tts(text: str):
+    global _tts_idx
+    clean = re.sub(r"\[CMD:.*?\]|[*`#_~>\[\](){}]", "", text).replace('"', "'").replace("\n", " ").strip()
+    if len(clean) > 1:
+        _tts_idx += 1
+        _play_q.put((clean, _synth_pool.submit(_synth_mp3, clean, _tts_idx)))
+
+def tts_wait():
+    _play_q.join()
+    
 def fast_route(raw: str) -> str | None:
-    t, low = raw.strip(), raw.strip().lower()
-    if low == "status":
+    t = re.sub(r"^(?:hey\s+)?tara[\s,]*", "", raw.strip(), flags=re.I).strip()
+    low = t.lower().rstrip(".!?")
+    if low in ("status", "check status", "system status", "battery", "ram"):
         class MEM(ctypes.Structure):
             _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + [(f"u{i}", ctypes.c_ulonglong) for i in range(7)]
         m = MEM(ctypes.sizeof(MEM)); ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
-        return f"RAM {m.dwMemoryLoad}% ({(m.u0 - m.u1)//1024**3}/{m.u0//1024**3}GB)"
-    if low == "free":
+        return f"RAM is at {m.dwMemoryLoad} percent, using {(m.u0 - m.u1)//1024**3} of {m.u0//1024**3} gigabytes."
+    if low in ("free", "free ram", "clear ram"):
         try: http_post("http://localhost:11434/api/generate", {"model": MODEL, "keep_alive": 0}, 2)
         except Exception: pass
-        return "RAM freed."
-    if low in ("quit", "exit"):
+        return "Local model unloaded from RAM."
+    if low in ("quit", "exit", "shut down", "shutdown"):
         try: http_post("http://localhost:11434/api/generate", {"model": MODEL, "keep_alive": 0}, 1)
         except Exception: pass
         os._exit(0)
-    if low == "ports":
+    if low in ("ports", "check ports", "scan ports"):
         import serial.tools.list_ports
         pts = [f"{p.device} ({p.description})" for p in serial.tools.list_ports.comports()]
-        return "Ports: " + (", ".join(pts) if pts else "None")
-    if low.startswith("ser "):
-        import serial
-        p = t.split(" ", 2)
-        with serial.Serial(p[1].upper(), 115200, timeout=1) as s:
-            if len(p) > 2: s.write((p[2] + "\n").encode()); time.sleep(0.15)
-            return f"[{p[1].upper()}]: " + (s.read_all().decode(errors="ignore").strip() or "Sent.")
+        return "Active ports: " + (", ".join(pts) if pts else "None detected.")
     if low.startswith("smd "):
-        c = t[4:].strip().upper()
+        c = low[4:].replace(" ", "").upper()
         v = float(c.replace("R", ".")) if "R" in c else (int(c[:-1]) * (10 ** int(c[-1])) if c.isdigit() and len(c) in (3, 4) else -1)
         return f"{v/1e6:g} MΩ" if v >= 1e6 else (f"{v/1e3:g} kΩ" if v >= 1e3 else (f"{v:g} Ω" if v >= 0 else "Invalid SMD"))
-    if low.startswith("remember "):
-        db_exec("INSERT INTO mem (k, v) VALUES ('fact', ?)", (t[9:].strip(),)); return "Stored."
-    if low == "memories":
-        return "\n".join(f"- {r[0]}" for r in db_exec("SELECT v FROM mem WHERE k='fact' ORDER BY id DESC LIMIT 8")) or "Empty."
-    if low.startswith(("yt ", "google ")):
-        q = urllib.parse.quote_plus(t.split(" ", 1)[1])
-        webbrowser.open(f"https://www.youtube.com/results?search_query={q}" if low.startswith("yt ") else f"https://www.google.com/search?q={q}")
-        return f"Opened: {t}"
-    if low.startswith("open "):
-        target = low[5:].strip()
-        if target in WEBS: webbrowser.open(WEBS[target]); return f"Web: {target}"
+    if low.startswith(("remember that ", "remember ")):
+        fact = re.sub(r"^remember(?:\s+that)?\s+", "", t, flags=re.I)
+        db_exec("INSERT INTO mem (k, v) VALUES ('fact', ?)", (fact,)); return f"Remembered: {fact}"
+    if low in ("memories", "what do you remember", "show memories"):
+        return "\n".join(f"- {r[0]}" for r in db_exec("SELECT v FROM mem WHERE k='fact' ORDER BY id DESC LIMIT 8")) or "Memory bank is empty."
+    if low.startswith(("yt ", "youtube ", "search youtube for ", "play ")):
+        q = urllib.parse.quote_plus(re.sub(r"^(?:yt|youtube|search youtube for|play)\s+", "", t, flags=re.I))
+        webbrowser.open(f"https://www.youtube.com/results?search_query={q}"); return "Opened YouTube."
+    if low.startswith(("google ", "search google for ", "search for ")):
+        q = urllib.parse.quote_plus(re.sub(r"^(?:google|search google for|search for)\s+", "", t, flags=re.I))
+        webbrowser.open(f"https://www.google.com/search?q={q}"); return "Opened Google."
+    if low.startswith(("open ", "launch ", "start ")):
+        target = re.sub(r"^(?:open|launch|start)\s+", "", low).strip()
+        if target in WEBS: webbrowser.open(WEBS[target]); return f"Opened {target}."
         if target in APPS:
             os.startfile(APPS[target]) if APPS[target].endswith(":") else subprocess.Popen(APPS[target], shell=True)
-            return f"App: {target}"
-        try: os.startfile(target); return f"Launched: {target}"
-        except Exception: return f"Not found: {target}"
+            return f"Launched {target}."
+        try: os.startfile(target); return f"Launched {target}."
+        except Exception: return f"Could not find {target}."
     return None
 
 class TARA(tk.Tk):
@@ -81,9 +127,15 @@ class TARA(tk.Tk):
         self.cv = tk.Canvas(self.row, width=24, height=24, bg="#141413", highlightthickness=0); self.cv.pack(side="left", padx=(0, 6))
         self.ent = tk.Entry(self.row, font=("Consolas", 11), bg="#1C1C1A", fg="#E6E4DD", insertbackground="#E6E4DD",
                             relief="flat", highlightthickness=1, highlightbackground="#2E2E2B", highlightcolor="#2E2E2B")
+        self.mode = "LOCAL"
+        self.badge = tk.Label(self.row, text="LOCAL", font=("Consolas", 9, "bold"), bg="#1C1C1A", fg="#8C8A82", padx=6, pady=3, cursor="hand2")
+        self.badge.pack(side="right", padx=(6, 0))
+        self.badge.bind("<Button-1>", lambda e: self.toggle_mode(False))
         self.ent.pack(side="left", fill="both", expand=True, ipady=4)
         self.ent.bind("<Return>", lambda e: self.submit(False))
         self.ent.bind("<Escape>", lambda e: self.toggle_ui(False))
+        self.last_q = ""
+        self.ent.bind("<Up>", lambda e: (self.ent.delete(0, "end"), self.ent.insert(0, self.last_q)))
         self.out = tk.Text(self, font=("Consolas", 10), bg="#1C1C1A", fg="#E6E4DD", relief="flat", wrap="word", height=7)
 
         self.state, self.phase, self.rms, self.last_hk, self.chat_loop = "idle", 0, 0.0, 0.0, False
@@ -193,17 +245,27 @@ class TARA(tk.Tk):
     def reset_ent(self, txt=""):
         self.state = "idle"; self.ent.configure(highlightbackground="#2E2E2B", highlightcolor="#2E2E2B")
         self.ent.delete(0, "end"); self.ent.insert(0, txt)
+    def toggle_mode(self, speak=False):
+        self.mode = "GLOBAL" if self.mode == "LOCAL" else "LOCAL"
+        self.badge.configure(text=self.mode, fg="#D79921" if self.mode == "GLOBAL" else "#8C8A82")
+        msg = f"Switched to {self.mode.lower()} AI."
+        self.reset_ent(msg)
+        if speak: threading.Thread(target=lambda: (enqueue_tts(msg), tts_wait(), self.after(200, self.start_listen_turn)), daemon=True).start()
 
     def submit(self, speak=False):
         q = self.ent.get().strip()
         if not q: return
-        self.ent.delete(0, "end"); fast = fast_route(q)
+        self.last_q = q; self.ent.delete(0, "end")
+        clean_cmd = re.sub(r"^(?:hey\s+)?tara[\s,]*", "", q.lower()).strip().rstrip(".!?")
+        if clean_cmd in ("switch", "switch mode", "switch ai", "change mode"):
+            self.toggle_mode(speak); return
+        fast = fast_route(q)
         self.geometry(f"{self.w}x{self.h_exp}+{self.x}+12"); self.out.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         if fast:
             self.out.insert("end", f"\n> {q}\n{fast}\n"); self.out.see("end")
-            if speak: threading.Thread(target=lambda: (speak_sync(fast), self.after(200, self.start_listen_turn)), daemon=True).start()
+            if speak: threading.Thread(target=lambda: (enqueue_tts(fast), tts_wait(), self.after(200, self.start_listen_turn)), daemon=True).start()
             return
-        self.state = "work"; self.out.insert("end", f"\nYou: {q}\nTARA: "); self.out.see("end")
+        self.state = "work"; self.out.insert("end", f"\nYou: {q}\nTARA [{self.mode}]: "); self.out.see("end")
         threading.Thread(target=self.ask_llm, args=(q, speak), daemon=True).start()
 
     def ask_llm(self, q: str, speak: bool):
@@ -214,42 +276,43 @@ class TARA(tk.Tk):
             q = q[5:].strip() or "Explain or fix this clipboard content."
         facts = [r[0] for r in db_exec("SELECT v FROM mem WHERE k='fact' ORDER BY id DESC LIMIT 5")]
         hist = [r[0] for r in db_exec("SELECT v FROM mem WHERE k='chat' ORDER BY id DESC LIMIT 6")][::-1]
-        sys_p = (
-            "You are T.A.R.A., an equal thinking partner and co-builder. Talk naturally like a sharp close friend in 1-3 sentences. "
-            "If the user wants an app opened, a YouTube search, or a fact remembered, append [CMD: open app], [CMD: yt query], or [CMD: remember fact] at the end.\n"
-        )
         ctx = ("Facts: " + "; ".join(facts) + "\n" if facts else "") + clip_ctx + "\n".join(hist) + f"\nYou: {q}\nTARA:"
-        ans = ""
+        ans, s_buf = "", ""
         try:
-            if q.lower().startswith("cloud:") and os.environ.get("GEMINI_API_KEY"):
+            if self.mode == "GLOBAL" and os.environ.get("GEMINI_API_KEY"):
                 u = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={os.environ['GEMINI_API_KEY']}"
                 r = json.loads(http_post(u, {"contents": [{"parts": [{"text": ctx}]}]}, 12).read().decode())
                 ans = r["candidates"][0]["content"]["parts"][0]["text"].strip()
                 self.after(0, lambda: (self.out.insert("end", ans + "\n"), self.out.see("end")))
+                if speak:
+                    for sent in re.split(r"(?<=[.!?])\s+|\n+", ans): enqueue_tts(sent)
             else:
                 with http_post("http://localhost:11434/api/generate", {"model": MODEL, "prompt": ctx, "stream": True, "keep_alive": "10m"}, 30) as r:
-                    buf = ""
+                    ui_buf = ""
                     for line in r:
                         tok = json.loads(line.decode()).get("response", "")
-                        ans += tok; buf += tok
-                        if len(buf) >= 12 or "\n" in buf:
-                            c = buf; buf = ""
+                        ans += tok; ui_buf += tok; s_buf += tok
+                        if len(ui_buf) >= 12 or "\n" in ui_buf:
+                            c = ui_buf; ui_buf = ""
                             self.after(0, lambda c=c: (self.out.insert("end", c), self.out.see("end")))
-                    if buf: self.after(0, lambda c=buf: self.out.insert("end", c))
+                        if speak and re.search(r"[.!?]\s|\n", s_buf) and len(s_buf) > 15:
+                            parts = re.split(r"(?<=[.!?])\s+|\n+", s_buf, maxsplit=1)
+                            if len(parts) > 1:
+                                enqueue_tts(parts[0]); s_buf = parts[1]
+                    if ui_buf: self.after(0, lambda c=ui_buf: self.out.insert("end", c))
                     self.after(0, lambda: (self.out.insert("end", "\n"), self.out.see("end")))
+                    if speak and s_buf.strip(): enqueue_tts(s_buf)
             if ans:
-                db_exec("INSERT INTO mem (k, v) VALUES ('chat', ?)", (f"You: {q}\nTARA: {ans.strip()}",))
+                for m in re.findall(r"\[CMD:\s*(.+?)\]", ans): fast_route(m)
+                clean_ans = re.sub(r"\[CMD:.*?\]", "", ans).strip()
+                db_exec("INSERT INTO mem (k, v) VALUES ('chat', ?)", (f"You: {q}\nTARA: {clean_ans}",))
                 db_exec("DELETE FROM mem WHERE k='chat' AND id NOT IN (SELECT id FROM mem WHERE k='chat' ORDER BY id DESC LIMIT 6)")
-                for m in re.findall(r"\[CMD:\s*(.+?)\]", ans):
-                    fast_route(m)
-                ans = re.sub(r"\[CMD:.*?\]", "", ans).strip()
-            if speak and ans: speak_sync(ans)
+            if speak: tts_wait()
         except Exception as e:
-            self.after(0, lambda: self.out.insert("end", f"ERR: {e}\n"))
+            self.after(0, lambda err=str(e): self.out.insert("end", f"ERR: {err}\n"))
         finally:
             self.after(0, lambda: setattr(self, "state", "idle"))
-            if self.chat_loop: time.sleep(0.25); self.after(0, self.start_listen_turn)
-
+            if self.chat_loop: time.sleep(0.2); self.after(0, self.start_listen_turn)
 if __name__ == "__main__":
     if ctypes.windll.kernel32.CreateMutexW(None, False, "TARA_V2_MUTEX") and ctypes.windll.kernel32.GetLastError() == 183:
         sys.exit(0)

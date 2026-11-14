@@ -1,20 +1,11 @@
-# Virtual Environment & Bytecode
 venv/
 __pycache__/
 *.py[cod]
-
-# Local Databases & Private Keys
-*.db
-*.db-journal
+*.db*
+*.mp3
 .env
-
-# PyInstaller & Old Build Artifacts
 build/
 dist/
 *.spec
 purge_list.txt
 all.txt
-
-# Heavy Local Model Weights
-*.onnx
-*.bin

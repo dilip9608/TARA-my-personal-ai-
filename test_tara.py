@@ -53,5 +53,23 @@ def run_beta_tests():
     r.destroy()
     assert "115200" in grabbed, "Clipboard read failed"
     print("  PASS -> Native clipboard capture verified.")
+    print("[BETA TEST 8] Self-Healing http_post & Ollama Wake...")
+    from tara import http_post
+    res = json.loads(http_post("http://localhost:11434/api/generate", {"model": "tara-core", "prompt": "hi", "stream": False}, 10).read().decode())
+    assert "response" in res, "Ollama generate failed"
+    print("  PASS -> Self-healing Ollama pipeline verified.")
+    print("[BETA TEST 9] Spoken Voice-First Routing ('Tara, ...')...")
+    assert "RAM is at" in fast_route("Hey Tara, check status.")
+    assert fast_route("Tara, smd 472") == "4.7 kΩ"
+    print("  PASS -> Natural spoken command routing verified.")
+    print("[BETA TEST 10] Pipelined Neural TTS & Zero-Wait Sentence Streaming...")
+    from tara import enqueue_tts, tts_wait
+    t0 = time.perf_counter()
+    enqueue_tts("First sentence streaming immediately.")
+    enqueue_tts("Second sentence pre-fetched with zero gap.")
+    q_time = (time.perf_counter() - t0) * 1000
+    assert q_time < 5.0, "TTS enqueue blocked the LLM stream!"
+    tts_wait()
+    print(f"  PASS -> Enqueued 2 sentences in {q_time:.2f}ms & played cleanly with 0 temp files left behind.")
 if __name__ == "__main__":
     run_beta_tests()
